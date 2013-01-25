@@ -48,9 +48,11 @@ public class SleepJob extends Configured implements Tool,
   private long mapSleepDuration = 100;
   private long reduceSleepDuration = 100;
   private int mapMemMb = 0;
+  private int mapBaseMb = 172;
   private int reduceMemMb = 0;
+  private int reduceBaseMb = 74;
   private long mem[];
-  private float memSlop = 0.8f; // fraction of *MemMb for array
+  private float overhead = 1.5f; // JVM overhead
   private Random rng;
   private int mapSleepCount = 1;
   private int reduceSleepCount = 1;
@@ -137,8 +139,7 @@ public class SleepJob extends Configured implements Tool,
       Thread.sleep(mapSleepDuration);
     }
     catch (InterruptedException ex) {
-      throw (IOException)new IOException(
-          "Interrupted while sleeping").initCause(ex);
+      throw new IOException("Interrupted while sleeping", ex);
     }
     ++count;
     // output reduceSleepCount * numReduce number of random values, so that
@@ -168,14 +169,14 @@ public class SleepJob extends Configured implements Tool,
 
   private void useMapMemory() {
     if (mapMemMb > 0) {
-      allocMemIfNeeded(mapMemMb);
+      allocMemIfNeeded(mapMemMb, mapBaseMb);
       useMemory();
     }
   }
 
   private void useReduceMemory() {
     if (reduceMemMb > 0) {
-      allocMemIfNeeded(reduceMemMb);
+      allocMemIfNeeded(reduceMemMb, reduceBaseMb);
       useMemory();
     }
   }
@@ -190,9 +191,9 @@ public class SleepJob extends Configured implements Tool,
     }
   }
 
-  private long[] allocMemIfNeeded(int mb) {
+  private long[] allocMemIfNeeded(int mb, int base) {
     if (mem == null) {
-      mem = new long[(int)(mb * 1024 * 1024 / 8 * memSlop)];
+      mem = new long[Math.max(1, mb - base)* 1024 * 1024 / 8];
       rng = new Random();
     }
     return mem;
@@ -208,9 +209,10 @@ public class SleepJob extends Configured implements Tool,
       job.getLong("sleep.job.map.sleep.time" , 100) / mapSleepCount;
     this.reduceSleepDuration =
       job.getLong("sleep.job.reduce.sleep.time" , 100) / reduceSleepCount;
-    this.mapMemMb = job.getInt("sleep.job.map.mb", mapMemMb);
-    this.reduceMemMb = job.getInt("sleep.job.reduce.mb", reduceMemMb);
-    this.memSlop = job.getFloat("sleep.job.mem.slop", 0.8f);
+    this.mapMemMb = job.getInt("sleep.job.map.mem.mb", mapMemMb);
+    this.reduceMemMb = job.getInt("sleep.job.reduce.mem.mb", reduceMemMb);
+    this.mapBaseMb = job.getInt("sleep.job.map.mem.base.mb", mapBaseMb);
+    this.reduceBaseMb = job.getInt("sleep.job.reduce.mem.base.mb", reduceBaseMb);
   }
 
   @Override
@@ -249,15 +251,15 @@ public class SleepJob extends Configured implements Tool,
     FileInputFormat.addInputPath(job, new Path("ignored"));
     job.setLong("sleep.job.map.sleep.time", mapSleepTime);
     job.setLong("sleep.job.reduce.sleep.time", reduceSleepTime);
-    job.setInt("sleep.job.map.mb", mapMemMb);
-    job.setInt("sleep.job.reduce.mb", reduceMemMb);
+    job.setInt("sleep.job.map.mem.mb", mapMemMb);
+    job.setInt("sleep.job.reduce.mem.mb", reduceMemMb);
     job.setInt("sleep.job.map.sleep.count", mapSleepCount);
     job.setInt("sleep.job.reduce.sleep.count", reduceSleepCount);
     if (mapMemMb > 0) {
-      job.set("mapred.map.child.java.opts", "-Xmx" + mapMemMb + "m");
+      job.set("mapred.map.child.java.opts", "-Xmx" + (int)(mapMemMb * overhead) + "m");
     }
     if (reduceMemMb > 0) {
-      job.set("mapred.reduce.child.java.opts", "-Xmx" + reduceMemMb + "m");
+      job.set("mapred.reduce.child.java.opts", "-Xmx" + (int)(reduceMemMb * overhead) + "m");
     }
     return job;
   }
@@ -269,7 +271,7 @@ public class SleepJob extends Configured implements Tool,
       System.err.println("sleep [-m numMapper] [-r numReducer]" +
           " [-mt mapSleepTime (msec)] [-mm mapMem (mb)]" +
           " [-rt reduceSleepTime (msec)] [-rm reduceMem (mb)]" +
-          " [-recordt recordSleepTime (msec)]");
+          " [-recordt recordSleepTime (msec)] [-mo memOverheadFactor (~1.5)");
       ToolRunner.printGenericCommandUsage(System.err);
       return -1;
     }
@@ -288,20 +290,22 @@ public class SleepJob extends Configured implements Tool,
       } else if (args[i].equals("-rt")) {
         reduceSleepTime = Long.parseLong(args[++i]);
       } else if (args[i].equals("-mm")) {
-        mapMemMb= Integer.parseInt(args[++i]);
+        mapMemMb = Integer.parseInt(args[++i]);
       } else if (args[i].equals("-rm")) {
         reduceMemMb = Integer.parseInt(args[++i]);
+      } else if (args[i].equals("-mo")) {
+        overhead = Float.parseFloat(args[++i]);
       } else if (args[i].equals("-recordt")) {
         recSleepTime = Long.parseLong(args[++i]);
       }
-  }
+    }
 
-    // sleep for *SleepTime duration in Task by recSleepTime per record
-    mapSleepCount = (int)Math.ceil(mapSleepTime / ((double)recSleepTime));
-    reduceSleepCount = (int)Math.ceil(reduceSleepTime / ((double)recSleepTime));
+    // sleep for *SleepTime duration in Task by recSleepTime + memory shuffle time per record
+    // assuming 1GB/s memory shuffle time
+    mapSleepCount = (int)Math.ceil(mapSleepTime / ((double)recSleepTime + mapMemMb));
+    reduceSleepCount = (int)Math.ceil(reduceSleepTime / ((double)recSleepTime + reduceMemMb));
 
     return run(numMapper, numReducer, mapSleepTime, mapSleepCount,
         reduceSleepTime, reduceSleepCount);
   }
-
 }
