@@ -256,10 +256,16 @@ public class SleepJob extends Configured implements Tool,
     job.setInt("sleep.job.map.sleep.count", mapSleepCount);
     job.setInt("sleep.job.reduce.sleep.count", reduceSleepCount);
     if (mapMemMb > 0) {
-      job.set("mapred.map.child.java.opts", "-Xmx" + (int)(mapMemMb * overhead) + "m");
+      job.set("mapred.map.child.java.opts",
+          "-Xmx" + (int)(mapMemMb * overhead) + "m");
     }
     if (reduceMemMb > 0) {
-      job.set("mapred.reduce.child.java.opts", "-Xmx" + (int)(reduceMemMb * overhead) + "m");
+      job.set("mapred.reduce.child.java.opts",
+          "-Xmx" + (int)(reduceMemMb * overhead) + "m");
+    }
+    if (mapMemMb > 0 || reduceMemMb > 0) {
+      job.setInt("mapred.child.ulimit",
+          (int)(Math.max(mapMemMb, reduceMemMb) * overhead * 3000));
     }
     return job;
   }
@@ -268,10 +274,10 @@ public class SleepJob extends Configured implements Tool,
   public int run(String[] args) throws Exception {
 
     if(args.length < 1) {
-      System.err.println("sleep [-m numMapper] [-r numReducer]" +
-          " [-mt mapSleepTime (msec)] [-mm mapMem (mb)]" +
-          " [-rt reduceSleepTime (msec)] [-rm reduceMem (mb)]" +
-          " [-recordt recordSleepTime (msec)] [-mo memOverheadFactor (~1.5)");
+      System.err.println("sleep [-m numMappers] [-r numReducers]" +
+          " [-mt mapTime (msec)] [-mm mapMemory (mb)]\n" +
+          "      [-rt reduceTime (msec)] [-rm reduceMemory (mb)]\n" +
+          "      [-recordt recordTime (msec)] [-mo memoryOverhead (~1.5)]\n");
       ToolRunner.printGenericCommandUsage(System.err);
       return -1;
     }
@@ -301,7 +307,7 @@ public class SleepJob extends Configured implements Tool,
     }
 
     // sleep for *SleepTime duration in Task by recSleepTime + memory shuffle time per record
-    // assuming 1GB/s memory shuffle time
+    // assuming 1GB/s memory shuffle speed
     mapSleepCount = (int)Math.ceil(mapSleepTime / ((double)recSleepTime + mapMemMb));
     reduceSleepCount = (int)Math.ceil(reduceSleepTime / ((double)recSleepTime + reduceMemMb));
 
