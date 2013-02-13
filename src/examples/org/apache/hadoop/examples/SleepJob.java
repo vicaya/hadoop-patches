@@ -23,6 +23,8 @@ import java.io.DataOutput;
 import java.util.Iterator;
 import java.util.Random;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.Path;
@@ -44,19 +46,22 @@ public class SleepJob extends Configured implements Tool,
              Mapper<IntWritable, IntWritable, IntWritable, NullWritable>,
              Reducer<IntWritable, NullWritable, NullWritable, NullWritable>,
              Partitioner<IntWritable,NullWritable> {
+  static final Log LOG = LogFactory.getLog(SleepJob.class);
 
-  private long mapSleepDuration = 100;
-  private long reduceSleepDuration = 100;
+  private long mapDuration = 1000;
+  private long reduceDuration = 1000;
+  private long recSleepTime = 100;
   private int mapMemMb = 0;
-  private int mapBaseMb = 172;
+  private int mapBaseMb = 70; // default for sun jdk
   private int reduceMemMb = 0;
-  private int reduceBaseMb = 74;
+  private int reduceBaseMb = 74; // ditto
+  private int memSpeedMbps = 188; // high estimate of random shuffle speed
   private long mem[];
-  private float overhead = 1.5f; // JVM overhead
+  private float overhead = 1.5f; // default JVM overhead
   private Random rng;
   private int mapSleepCount = 1;
   private int reduceSleepCount = 1;
-  private int count = 0;
+  private long startTime = System.currentTimeMillis();
 
   @Override
   public int getPartition(IntWritable k, NullWritable v, int numPartitions) {
@@ -131,17 +136,17 @@ public class SleepJob extends Configured implements Tool,
       OutputCollector<IntWritable, NullWritable> output, Reporter reporter)
       throws IOException {
 
-    //it is expected that every map processes mapSleepCount number of records.
-    try {
+    // It is expected that every map processes mapSleepCount number of records.
+    // The check lessens the impact of variations in memory shuffle speed.
+    long elapsed = System.currentTimeMillis() - startTime;
+    if (elapsed < mapDuration) try {
+      reporter.setStatus((mapDuration - elapsed) +" ms left");
       useMapMemory();
-      reporter.setStatus("Sleeping... (" +
-          (mapSleepDuration * (mapSleepCount - count)) + ") ms left");
-      Thread.sleep(mapSleepDuration);
+      Thread.sleep(recSleepTime);
     }
     catch (InterruptedException ex) {
       throw new IOException("Interrupted while sleeping", ex);
     }
-    ++count;
     // output reduceSleepCount * numReduce number of random values, so that
     // each reducer will get reduceSleepCount number of keys.
     int k = key.get();
@@ -154,17 +159,16 @@ public class SleepJob extends Configured implements Tool,
   public void reduce(IntWritable key, Iterator<NullWritable> values,
       OutputCollector<NullWritable, NullWritable> output, Reporter reporter)
       throws IOException {
-    try {
+    long elapsed = System.currentTimeMillis() - startTime;
+    if (elapsed < reduceDuration) try {
+      reporter.setStatus((reduceDuration - elapsed) + " ms left");
       useReduceMemory();
-      reporter.setStatus("Sleeping... (" +
-          (reduceSleepDuration * (reduceSleepCount - count)) + ") ms left");
-        Thread.sleep(reduceSleepDuration);
+      Thread.sleep(recSleepTime);
     }
     catch (InterruptedException ex) {
       throw (IOException)new IOException(
           "Interrupted while sleeping").initCause(ex);
     }
-    count++;
   }
 
   private void useMapMemory() {
@@ -183,17 +187,20 @@ public class SleepJob extends Configured implements Tool,
 
   private void useMemory() {
     // Fisher-Yates shuffle to keep the memory pressure
+    long startTime = System.currentTimeMillis();
     for (int i = mem.length - 1; i > 0; --i) {
       long tmp = mem[i];
       int j = rng.nextInt(i + 1); // n in nextInt(n) is exclusive
       mem[i] = mem[j];
       mem[j] = tmp;
     }
+    LOG.info("random memory shuffle speed: "+ mem.length/1024./1024*8000/
+        (System.currentTimeMillis()-startTime) + " MB/s");
   }
 
   private long[] allocMemIfNeeded(int mb, int base) {
     if (mem == null) {
-      mem = new long[Math.max(1, mb - base)* 1024 * 1024 / 8];
+      mem = new long[(int)(Math.max(1, mb - base) / 8. * 1024 * 1024)];
       rng = new Random();
     }
     return mem;
@@ -205,14 +212,18 @@ public class SleepJob extends Configured implements Tool,
       job.getInt("sleep.job.map.sleep.count", mapSleepCount);
     this.reduceSleepCount =
       job.getInt("sleep.job.reduce.sleep.count", reduceSleepCount);
-    this.mapSleepDuration =
-      job.getLong("sleep.job.map.sleep.time" , 100) / mapSleepCount;
-    this.reduceSleepDuration =
-      job.getLong("sleep.job.reduce.sleep.time" , 100) / reduceSleepCount;
+    this.mapDuration =
+      job.getLong("sleep.job.map.sleep.time" , mapDuration);
+    this.reduceDuration =
+      job.getLong("sleep.job.reduce.sleep.time" , reduceDuration);
+    this.recSleepTime = job.getLong("sleep.job.record.sleep.time", recSleepTime);
     this.mapMemMb = job.getInt("sleep.job.map.mem.mb", mapMemMb);
     this.reduceMemMb = job.getInt("sleep.job.reduce.mem.mb", reduceMemMb);
     this.mapBaseMb = job.getInt("sleep.job.map.mem.base.mb", mapBaseMb);
     this.reduceBaseMb = job.getInt("sleep.job.reduce.mem.base.mb", reduceBaseMb);
+    if (job.getInt("mapred.reduce.tasks", 0) > 0) {
+      mapBaseMb += 100; // maps somehow use more memory when numReducers > 0
+    }
   }
 
   @Override
@@ -251,21 +262,22 @@ public class SleepJob extends Configured implements Tool,
     FileInputFormat.addInputPath(job, new Path("ignored"));
     job.setLong("sleep.job.map.sleep.time", mapSleepTime);
     job.setLong("sleep.job.reduce.sleep.time", reduceSleepTime);
+    job.setLong("sleep.job.record.sleep.time", recSleepTime);
     job.setInt("sleep.job.map.mem.mb", mapMemMb);
     job.setInt("sleep.job.reduce.mem.mb", reduceMemMb);
     job.setInt("sleep.job.map.sleep.count", mapSleepCount);
     job.setInt("sleep.job.reduce.sleep.count", reduceSleepCount);
     if (mapMemMb > 0) {
       job.set("mapred.map.child.java.opts",
-          "-Xmx" + (int)(mapMemMb * overhead) + "m");
+          "-Xmx" + (int)Math.max(512, mapMemMb * overhead) + "m");
     }
     if (reduceMemMb > 0) {
       job.set("mapred.reduce.child.java.opts",
-          "-Xmx" + (int)(reduceMemMb * overhead) + "m");
+          "-Xmx" + (int)Math.max(512, reduceMemMb * overhead) + "m");
     }
     if (mapMemMb > 0 || reduceMemMb > 0) {
       job.setInt("mapred.child.ulimit",
-          (int)(Math.max(mapMemMb, reduceMemMb) * overhead * 3000));
+          (int)(Math.max(512, Math.max(mapMemMb, reduceMemMb)) * overhead * 3000));
     }
     return job;
   }
@@ -283,7 +295,7 @@ public class SleepJob extends Configured implements Tool,
     }
 
     int numMapper = 1, numReducer = 1;
-    long mapSleepTime = 100, reduceSleepTime = 100, recSleepTime = 100;
+    long mapSleepTime = 100, reduceSleepTime = 100;
     int mapSleepCount = 1, reduceSleepCount = 1;
 
     for (int i = 0; i < args.length; i++) {
@@ -306,10 +318,12 @@ public class SleepJob extends Configured implements Tool,
       }
     }
 
-    // sleep for *SleepTime duration in Task by recSleepTime + memory shuffle time per record
-    // assuming 1GB/s memory shuffle speed
-    mapSleepCount = (int)Math.ceil(mapSleepTime / ((double)recSleepTime + mapMemMb));
-    reduceSleepCount = (int)Math.ceil(reduceSleepTime / ((double)recSleepTime + reduceMemMb));
+    // Expected elapsed time in Task: recSleepTime + memory shuffle time per record
+    mapSleepCount = (int)Math.ceil(mapSleepTime /
+        (recSleepTime + Math.max(0, mapMemMb - mapBaseMb) * 1000. / memSpeedMbps));
+    reduceSleepCount = (int)Math.ceil(reduceSleepTime /
+        (recSleepTime + Math.max(0, reduceMemMb - reduceBaseMb) * 1000. / memSpeedMbps));
+    LOG.info("mapCount:"+ mapSleepCount +"\treduceCount:"+ reduceSleepCount);
 
     return run(numMapper, numReducer, mapSleepTime, mapSleepCount,
         reduceSleepTime, reduceSleepCount);
